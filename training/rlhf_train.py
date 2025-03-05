@@ -474,6 +474,7 @@ def main():
             )
         elif args.peft_model_name_or_path:
             sft_model = AutoPeftModelForCausalLM.from_pretrained(args.peft_model_name_or_path, is_trainable=True)
+            print(sft_model)
             model = AutoModelForCausalLMWithValueHead.from_pretrained(
                 sft_model,
                 trust_remote_code=args.trust_remote_code,

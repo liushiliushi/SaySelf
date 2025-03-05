@@ -1,4 +1,4 @@
-MODEL="<Your Stage-1 tuned model here>"
+MODEL="output/model_lr7e-5_bs32"
 train_file=../datasets/stage_2/hotpotqa.json
 NUM_GPUS=4
 BATCH_SIZE_PER_GPU=8

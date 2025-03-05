@@ -1,20 +1,23 @@
-MODEL=mistralai/Mistral-7B-Instruct-v0.2
+# MODEL=mistralai/Mistral-7B-Instruct-v0.2
+MODEL=../../meta-llama/Llama-3.1-8B-Instruct
 train_file=../datasets/stage_1/sft_reason_conf.jsonl
 NUM_GPUS=4
-BATCH_SIZE_PER_GPU=8
+BATCH_SIZE_PER_GPU=2
 LEARNING_RATE=7e-5
-TOTAL_BATCH_SIZE=128 # max 2 for 2 GPUs
+TOTAL_BATCH_SIZE=32 # max 2 for 2 GPUs
 GRADIENT_ACC_STEPS=$(($TOTAL_BATCH_SIZE/$NUM_GPUS/$BATCH_SIZE_PER_GPU))
 OUTPUT_DIR=model_lr${LEARNING_RATE}_bs${TOTAL_BATCH_SIZE}
 echo "Training ${MODEL} model using $NUM_GPUS GPUs, $BATCH_SIZE_PER_GPU batch size per GPU, $GRADIENT_ACC_STEPS gradient accumulation steps"
 
 # Lora training
+# --use_deepspeed \ 
+# --deepspeed_config_file ../ds_configs/stage3_no_offloading_accelerate.conf \
 accelerate launch \
     --mixed_precision bf16 \
     --num_machines 1 \
     --num_processes $NUM_GPUS \
     --use_deepspeed \
-    --deepspeed_config_file ../ds_configs/stage3_no_offloading_accelerate.conf \
+    --deepspeed_config_file ../ds_configs/stage2_no_offloading_accelerate.conf \
     ./finetune.py \
     --model_name_or_path $MODEL \
     --tokenizer_name $MODEL \

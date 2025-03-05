@@ -17,7 +17,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
-# from deepspeed import get_accelerator
+from deepspeed import get_accelerator
 import json
 import jsonlines
 from peft import AutoPeftModelForCausalLM
@@ -757,104 +757,7 @@ def main():
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
-
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
-        total_loss = 0
-        if (
-            args.resume_from_checkpoint
-            and epoch == starting_epoch
-            and resume_step is not None
-        ):
-            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(
-                train_dataloader, resume_step
-            )
-        else:
-            active_dataloader = train_dataloader
-        for step, batch in enumerate(active_dataloader):
-            outputs = model(**batch, use_cache=False)
-            if args.reduce_loss == 'mean':
-                loss = outputs.loss
-            else:
-                # reduce loss is sum
-                logits = outputs.logits
-                labels = batch["labels"]
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-                shift_logits = shift_logits.view(-1, embedding_size)
-                shift_labels = shift_labels.view(-1)
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-
-            # We keep track of the loss at each logged step
-            total_loss += loss.detach().float()
-            accelerator.backward(loss)
-            
-            # 让 DeepSpeed 处理梯度累积
-            if accelerator.sync_gradients:
-                if args.clip_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                lr_scheduler.step()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
-                if args.logging_steps and completed_steps % args.logging_steps == 0:
-                    avg_loss = accelerator.gather(total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
-                    logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
-                    if args.with_tracking:
-                        accelerator.log(
-                            {
-                                "learning_rate": lr_scheduler.get_last_lr()[0],
-                                "train_loss": avg_loss,
-                            },
-                            step=completed_steps,
-                        )
-                    total_loss = 0
-                    
-                if isinstance(checkpointing_steps, int):
-                    if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps}"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-
-                if completed_steps >= args.max_train_steps:
-                    break
-            if step % 200 == 0 and step != 0:
-                # test output with a random data from training set
-                # fetch a random data from training set
-                logger.info("Generating test...")
-                random_data = random.choice(train_dataset)
-                input_ids, attention_mask = random_data["input_ids"].unsqueeze(0).to(accelerator.device), random_data["attention_mask"].unsqueeze(0).to(accelerator.device)
-                labels = random_data["labels"].unsqueeze(0).to(accelerator.device)
-                # delete the labels from input_ids and attention_mask
-                input_ids[labels != -100] = tokenizer.pad_token_id
-                attention_mask[labels != -100] = 0
-                with torch.no_grad():
-                    output = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        do_sample=True,
-                        max_new_tokens=128,
-                        top_k=50,
-                        top_p=0.95,
-                        temperature=0.7,
-                        num_return_sequences=1,
-                    )
-                logger.info(f"Generated test:\nInput: {tokenizer.decode(input_ids[0], skip_special_tokens=True)}\nOutput: {tokenizer.decode(output[0], skip_special_tokens=True)}")
-
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            
+         
     if args.with_tracking:
         accelerator.end_training()
 
@@ -878,13 +781,14 @@ def main():
             # Emergency save without synchronization
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
-                print(unwrapped_model)
-                state_dict = accelerator.get_state_dict(model)
-                # unwrapped_model = unwrapped_model.merge_and_unload()
-                # print(unwrapped_model)
-                # unwrapped_model = unwrapped_model.to(dtype=torch.float16)
-                # unwrapped_model.save_pretrained(args.output_dir)
+                state_dict = accelerator.get_state_dict(unwrapped_model)
+                model = unwrapped_model.to(dtype=torch.float32)
+                # model = model.merge_and_unload()
+                # print(model)
+                # model = model.to(dtype=torch.float16)
+                # model.save_pretrained(args.output_dir)
                 # tokenizer.save_pretrained(args.output_dir)
+                # print("saved model")
                 if args.use_lora:
                     if accelerator.is_main_process:
                         unwrapped_model.save_pretrained(args.output_dir, state_dict=state_dict)
@@ -893,6 +797,7 @@ def main():
                             args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict,
                             safe_serialization=False
                         )
+
 
 
 if __name__ == "__main__":
