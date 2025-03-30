@@ -1,12 +1,12 @@
 # MODEL=mistralai/Mistral-7B-Instruct-v0.2
-MODEL=../../meta-llama/Llama-3.1-8B-Instruct
+MODEL=../../meta-llama/Qwen2.5-7B-Instruct 
 train_file=../datasets/stage_1/sft_reason_conf.jsonl
-NUM_GPUS=4
-BATCH_SIZE_PER_GPU=2
+NUM_GPUS=8
+BATCH_SIZE_PER_GPU=4
 LEARNING_RATE=7e-5
-TOTAL_BATCH_SIZE=32 # max 2 for 2 GPUs
+TOTAL_BATCH_SIZE=128 # max 2 for 2 GPUs
 GRADIENT_ACC_STEPS=$(($TOTAL_BATCH_SIZE/$NUM_GPUS/$BATCH_SIZE_PER_GPU))
-OUTPUT_DIR=model_lr${LEARNING_RATE}_bs${TOTAL_BATCH_SIZE}
+OUTPUT_DIR=qwen_lr${LEARNING_RATE}_bs${TOTAL_BATCH_SIZE}
 echo "Training ${MODEL} model using $NUM_GPUS GPUs, $BATCH_SIZE_PER_GPU batch size per GPU, $GRADIENT_ACC_STEPS gradient accumulation steps"
 
 # Lora training

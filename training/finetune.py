@@ -313,35 +313,63 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
     if len(messages) == 0:
         raise ValueError('messages field is empty.')
     
-    def _concat_messages(messages):
-        message_text = ""
-        for message in messages:
-            if message["role"] == "system":
-                message_text += "[INST]\n" + message["content"].strip() + "[/INST]\n"
-            elif message["role"] == "user":
-                message_text += "[INST]\n" + message["content"].strip() + "[/INST]\n"
-            elif message["role"] == "assistant":
-                message_text += message["content"].strip() + tokenizer.eos_token + "\n"
-            else:
-                raise ValueError("Invalid role: {}".format(message["role"]))
-        return message_text
-        
-    example_text = _concat_messages(messages).strip()
-    if add_bos:
-        example_text = tokenizer.bos_token + example_text
+    example_text = tokenizer.apply_chat_template(messages, tokenize=False, padding="longest", truncation=True, return_tensors="pt",  max_length=8192)
+
     tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
     input_ids = tokenized_example.input_ids
     labels = input_ids.clone()
-
-    tokenized_prompt = tokenizer(_concat_messages(messages[:-1]).strip(), return_tensors='pt', max_length=max_seq_length, truncation=True)
+    prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, padding="longest", truncation=True, return_tensors="pt",  max_length=8192)
+    tokenized_prompt = tokenizer(prompt_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
     labels[:, :tokenized_prompt.input_ids.shape[1]] = -100
-
     attention_mask = torch.ones_like(input_ids)
-    return {
+
+    result = {
         'input_ids': input_ids.flatten(),
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten(),
     }
+    return result
+
+# def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=False):
+#     '''
+#     Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
+#     We concatenate all messages with the roles as delimiters and tokenize them together.
+#     '''
+#     messages = example['messages']
+#     if len(messages) == 0:
+#         raise ValueError('messages field is empty.')
+    
+#     def _concat_messages(messages):
+#         message_text = ""
+#         for message in messages:
+#             if message["role"] == "system":
+#                 message_text += "[INST]\n" + message["content"].strip() + "[/INST]\n"
+#             elif message["role"] == "user":
+#                 message_text += "[INST]\n" + message["content"].strip() + "[/INST]\n"
+#             elif message["role"] == "assistant":
+#                 message_text += message["content"].strip() + tokenizer.eos_token + "\n"
+#             else:
+#                 raise ValueError("Invalid role: {}".format(message["role"]))
+#         return message_text
+        
+#     example_text = _concat_messages(messages).strip()
+#     if add_bos:
+#         example_text = tokenizer.bos_token + example_text
+#     tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
+#     input_ids = tokenized_example.input_ids
+#     labels = input_ids.clone()
+
+#     tokenized_prompt = tokenizer(_concat_messages(messages[:-1]).strip(), return_tensors='pt', max_length=max_seq_length, truncation=True)
+#     labels[:, :tokenized_prompt.input_ids.shape[1]] = -100
+
+#     attention_mask = torch.ones_like(input_ids)
+#     result = {
+#         'input_ids': input_ids.flatten(),
+#         'labels': labels.flatten(),
+#         'attention_mask': attention_mask.flatten(),
+#     }
+#     print(result)
+#     return result
 
 def encode_with_qr_format(question, response, tokenizer, max_seq_length, add_bos=False):
     example_text = f"[INST]\n{question.strip()}\n[/INST]\n{response.strip()}\n"
@@ -464,7 +492,7 @@ def main():
         logger.info(f"After filtering, there are {len(raw_datasets['train'])} examples in the training set.")
         raw_datasets['train'] = datasets.Dataset.from_dict(raw_datasets['train'][:args.num_train_examples])
         logger.info(f"Sample of the training set: {random.choice(raw_datasets['train'])}")
-
+    print(f"length: {len(raw_datasets['train'])}")
     # Load pretrained model and tokenizer
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
@@ -479,18 +507,20 @@ def main():
 
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=args.trust_remote_code, use_fast=not args.use_slow_tokenizer)
+        # tokenizer = AutoTokenizer.from_pretrained("../../meta-llama/Ministral-8B-Instruct-2410", trust_remote_code=True,legacy=False)
+
     elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, use_fast=not args.use_slow_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, )    
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-
-    # 添加这段代码来确保设置了 pad_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    # # 添加这段代码来确保设置了 pad_token
+    # if tokenizer.pad_token is None:
+    #     tokenizer.pad_token = tokenizer.eos_token
+    #     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if args.model_name_or_path:
         if args.use_qlora:
@@ -586,10 +616,18 @@ def main():
             r=args.lora_rank, 
             lora_alpha=args.lora_alpha, 
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"]
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
+            modules_to_save=None
         )
         model = get_peft_model(model, peft_config)
+        # 打印可训练参数信息
         model.print_trainable_parameters()
+        
+        # 确保所有 LoRA 参数都被标记为可训练
+        for name, param in model.named_parameters():
+            if "lora" in name:
+                param.requires_grad = True
 
     # Preprocessing the datasets.
     if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
@@ -638,16 +676,27 @@ def main():
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
+    
+    # 确保模型有可训练参数
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found in the model!")
+        
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
             "weight_decay": 0.0,
         },
     ]
+
+    # 检查优化器参数组是否为空
+    if not any(len(g["params"]) > 0 for g in optimizer_grouped_parameters):
+        raise ValueError("No parameters to optimize found!")
+
     if args.use_qlora:
         from bitsandbytes.optim import AdamW
         optimizer = AdamW(
@@ -878,7 +927,6 @@ def main():
             # Emergency save without synchronization
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
-                print(unwrapped_model)
                 state_dict = accelerator.get_state_dict(model)
                 # unwrapped_model = unwrapped_model.merge_and_unload()
                 # print(unwrapped_model)

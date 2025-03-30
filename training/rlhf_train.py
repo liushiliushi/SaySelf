@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
 from deepspeed import get_accelerator
+from accelerate import PartialState
+
 import json
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
 import re
@@ -27,6 +29,7 @@ from peft import AutoPeftModelForCausalLM, get_peft_model, PeftModel
 from transformers import MistralForCausalLM, StoppingCriteria
 import transformers
 import traceback
+import torch.distributed as dist
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -42,6 +45,8 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+
+print('Using transformers:', transformers.__file__, transformers.__version__)
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -287,7 +292,7 @@ def parse_args():
     parser.add_argument(
         '--num_train_examples',
         type=int,
-        default=20000,
+        default=200,
         help='Number of training examples to use. Default is 20000.',
     )
     parser.add_argument(
@@ -299,7 +304,7 @@ def parse_args():
     parser.add_argument(
         '--num_retries',
         type=int,
-        default=3,
+        default=1,
         help='Number of retries for tokenization. Default is 3.',
     )
     args = parser.parse_args()
@@ -339,11 +344,14 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
             else:
                 raise ValueError("Invalid role: {}".format(message["role"]))
         return message_text, answer_text
-    example_text, answer_text = _concat_messages(messages)
-
+    # example_text, answer_text = _concat_messages(messages)
+    tokenizer.padding_side = "left"
+    example_text=tokenizer.apply_chat_template([messages[0]], tokenize=False, padding="longest", truncation=True, return_tensors="pt",  max_length=8192)
+    answer_text=tokenizer.apply_chat_template([messages[1]], tokenize=False, padding="longest", truncation=True, return_tensors="pt",  max_length=8192)
+    print(example_text, answer_text)
     if add_bos:
         example_text = tokenizer.bos_token + example_text
-    # tokenizer.padding_side = "left"
+    tokenizer.padding_side = "left"
     tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
     input_ids = tokenized_example.input_ids
 
@@ -378,6 +386,7 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
         )
 
 def main():
+    accelerator = Accelerator()
     try:
         args = parse_args()
         output_reasons = []
@@ -414,6 +423,7 @@ def main():
                 args.dataset_config_name,
             )
         else:
+            print()
             data_files = {}
             dataset_args = {}
             if args.train_file is not None:
@@ -423,8 +433,8 @@ def main():
             raw_datasets = raw_datasets.train_test_split(test_size=0.01, seed=args.seed)
             # filter out examples with too long messages (Currently set to 400 words)
             print(f"Currently, there are {len(raw_datasets['train'])} examples in the training set.")
-            raw_datasets['train'] = raw_datasets['train'].filter(lambda example: sum([len(d['content'].split()) for d in example['messages']]) < 100)
-            raw_datasets['test'] = raw_datasets['test'].filter(lambda example: sum([len(d['content'].split()) for d in example['messages']]) < 100)
+            raw_datasets['train'] = raw_datasets['train'].filter(lambda example: sum([len(d['content'].split()) for d in example['messages']]) < 50)
+            raw_datasets['test'] = raw_datasets['test'].filter(lambda example: sum([len(d['content'].split()) for d in example['messages']]) < 50)
             print(f"After filtering, there are {len(raw_datasets['train'])} examples in the training set.")
             raw_datasets['train'] = datasets.Dataset.from_dict(raw_datasets['train'][:args.num_train_examples])
 
@@ -455,12 +465,16 @@ def main():
         elif args.model_name_or_path:
             tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, use_fast=not args.use_slow_tokenizer)
         elif args.peft_model_name_or_path:
-            tokenizer = AutoTokenizer.from_pretrained(args.peft_model_name_or_path, trust_remote_code=args.trust_remote_code, use_fast=not args.use_slow_tokenizer)
+            # TODO:change
+            tokenizer = AutoTokenizer.from_pretrained("../../meta-llama/Llama-3.1-8B-Instruct", trust_remote_code=args.trust_remote_code, use_fast=not args.use_slow_tokenizer)
         else:
             raise ValueError(
                 "You are instantiating a new tokenizer from scratch. This is not supported by this script."
                 "You can do it from another script, save it, and load it from here, using --tokenizer_name."
             )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         if args.model_name_or_path:
             model = AutoModelForCausalLM.from_pretrained(
@@ -474,7 +488,6 @@ def main():
             )
         elif args.peft_model_name_or_path:
             sft_model = AutoPeftModelForCausalLM.from_pretrained(args.peft_model_name_or_path, is_trainable=True)
-            print(sft_model)
             model = AutoModelForCausalLMWithValueHead.from_pretrained(
                 sft_model,
                 trust_remote_code=args.trust_remote_code,
@@ -486,32 +499,32 @@ def main():
         else:
             print("Training new model from scratch")
             model = AutoModelForCausalLM.from_config(config)
-        
+
         ppo_config = PPOConfig(
             model_name=args.model_name_or_path,
             query_dataset=args.dataset_name if args.dataset_name is not None else "custom",
             reward_model=GPTAnswerScoring(),
             tracker_project_name="score_reinforcement",
             learning_rate=args.learning_rate,
-            # batch_size=args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps,
-            batch_size=args.train_micro_batch_size_per_gpu,
-            # gradient_accumulation_steps=args.gradient_accumulation_steps,
+            batch_size=args.train_micro_batch_size_per_gpu * PartialState().num_processes * args.gradient_accumulation_steps,
+            # batch_size=args.train_micro_batch_size_per_gpu,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            mini_batch_size=args.gradient_accumulation_steps * args.train_micro_batch_size_per_gpu,
             # world_size=get_accelerator().num_processes,
             ppo_epochs=args.num_train_epochs,
             max_grad_norm=0,
             optimize_device_cache=True,
-            use_score_scaling=True,
+            use_score_scaling=False,
             use_score_norm=True,
             whiten_rewards=False,
             **accelerator_log_kwargs,
             accelerator_kwargs={"step_scheduler_with_optimizer": False,},
         )
-        
         answer_scorer = GPTAnswerScoring()
         
         generation_kwargs = {
             "do_sample": True,
-            "max_new_tokens": 150,
+            "max_new_tokens": 100,
             "top_k": 50,
             # "top_p": 0.9,
             "temperature": 0.7,
@@ -592,7 +605,6 @@ def main():
         ]
 
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-        
         ppo_trainer = PPOTrainer(
             model=model,
             dataset=train_dataset,
@@ -627,8 +639,8 @@ def main():
             collate_fn=MyDataCollator(tokenizer),
         )
 
-        train_dataset, train_dataloader = ppo_trainer.accelerator.prepare(train_dataset, train_dataloader)
-        test_dataset, test_dataloader = ppo_trainer.accelerator.prepare(test_dataset, test_dataloader)
+        # train_dataset, train_dataloader = ppo_trainer.accelerator.prepare(train_dataset, train_dataloader)
+        # test_dataset, test_dataloader = ppo_trainer.accelerator.prepare(test_dataset, test_dataloader)
 
         # Scheduler and math around the number of training steps.
         overrode_max_train_steps = False
@@ -741,8 +753,12 @@ def main():
                 active_dataloader = train_dataloader
             for step, batch in enumerate(active_dataloader):
                 try:
-                    with ppo_trainer.accelerator.accumulate(model):
+                    # with ppo_trainer.accelerator.accumulate(model):
+                    if True:
                         input_ids, attention_mask = batch['input_ids'], batch['attention_mask']
+                        print("===========")
+                        print(input_ids)
+                        print(tokenizer.decode(input_ids[0]))
                         labels = batch['answer']
                         questions = batch['question']
                         
@@ -753,8 +769,10 @@ def main():
                             input_ids[i] = input_ids[i][mask == 1]
                         response_tensors = ppo_trainer.generate(input_ids, **generation_kwargs,
                                                                 stopping_criteria=MyStoppingCriteria(tokenizer))
-                        response = [tokenizer.decode(r.squeeze(), skip_special_tokens=True).replace('<pad>', '') for r in response_tensors]
-                        
+                        # response = [tokenizer.decode(r.squeeze(), skip_special_tokens=True).replace('<pad>', '') for r in response_tensors]
+                        response = [tokenizer.decode(r.squeeze(), skip_special_tokens=True) for r in response_tensors]
+                        print("*********************")
+                        print(response[0])
                         # Check each response: if a response is nonsensical or doesn't contain a percent sign, retry the generation by telling them I am ... sure
                         to_retry_idx = []
                         retried_old_length = {}
@@ -862,9 +880,12 @@ def main():
                             assert x.size(0) == r.size(0), f"Response tensor and mask have different lengths: {x.size(0)} vs {r.size(0)}"
                         # logger.info(f"unmasked response: {response_tensors[0][response_masks[0].bool()]}, {tokenizer.decode(response_tensors[0][response_masks[0].bool()])}")
                         stats = ppo_trainer.step(input_ids, response_tensors, reward_tensor, response_masks)
+
                         # delete all inf and nan values in stats
                         # stats = {k: v for k, v in stats.items() if not torch.isnan(v) and not torch.isinf(v)}
                         reward_tensor = [torch.nan_to_num(t) for t in reward_tensor]
+                        print("stats:", stats)
+                        print("reward_tensor:", reward_tensor)
                         ppo_trainer.log_stats(stats, log_batch, reward_tensor)
                 except RuntimeError as e:
                     logger.error(f"Error in step {step}: {e}")
@@ -959,13 +980,15 @@ def main():
             ppo_trainer.accelerator.end_training()
 
         if args.output_dir is not None:
-            ppo_trainer.accelerator.wait_for_everyone()
+            # ppo_trainer.accelerator.wait_for_everyone()
             if ppo_trainer.accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-            save_with_accelerate(ppo_trainer.accelerator, model, tokenizer, args.output_dir, args)
+                save_with_accelerate(ppo_trainer.accelerator, model, tokenizer, args.output_dir, args)
             # Output reasons for the responses
             with open(os.path.join(args.output_dir, "output_reasons.json"), "w") as f:
                 json.dump(output_reasons, f)
+
+
     except KeyboardInterrupt as e:
         # save model
         logger.info("SIGINT received. Saving model...")
